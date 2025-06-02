@@ -93,11 +93,23 @@ def _write_ninja_file(path,
     if with_cuda:
         flags.append(f'cuda_cflags = {" ".join(cuda_cflags)}')
         flags.append(f'cuda_post_cflags = {" ".join(cuda_post_cflags)}')
-        cuda_post_cflags_sm80 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_80,code=sm_80' for s in cuda_post_cflags]
+        # Architecture-specific flags
+        cuda_post_cflags_sm90 = ['-gencode', 'arch=compute_90a,code=sm_90a']
+        flags.append(f'cuda_post_cflags_sm90 = {" ".join(cuda_post_cflags_sm90)}')
+
+        cuda_post_cflags_sm80 = ['-gencode', 'arch=compute_80,code=sm_80']
         flags.append(f'cuda_post_cflags_sm80 = {" ".join(cuda_post_cflags_sm80)}')
-        cuda_post_cflags_sm80_sm90 = cuda_post_cflags + ['-gencode', 'arch=compute_80,code=sm_80']
+
+        cuda_post_cflags_sm86 = ['-gencode', 'arch=compute_86,code=sm_86', '--expt-relaxed-constexpr']
+        flags.append(f'cuda_post_cflags_sm86 = {" ".join(cuda_post_cflags_sm86)}')
+
+        cuda_post_cflags_sm89 = ['-gencode', 'arch=compute_89,code=sm_89', '--expt-relaxed-constexpr']
+        flags.append(f'cuda_post_cflags_sm89 = {" ".join(cuda_post_cflags_sm89)}')
+
+        cuda_post_cflags_sm80_sm90 = cuda_post_cflags_sm80 + cuda_post_cflags_sm90
         flags.append(f'cuda_post_cflags_sm80_sm90 = {" ".join(cuda_post_cflags_sm80_sm90)}')
-        cuda_post_cflags_sm100 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_100a,code=sm_100a' for s in cuda_post_cflags]
+
+        cuda_post_cflags_sm100 = ['-gencode', 'arch=compute_100a,code=sm_100a']
         flags.append(f'cuda_post_cflags_sm100 = {" ".join(cuda_post_cflags_sm100)}')
     flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
     flags.append(f'ldflags = {" ".join(ldflags)}')
@@ -130,8 +142,20 @@ def _write_ninja_file(path,
             # on Linux so use --generate-dependencies-with-compile
             # to make this work on Windows too.
             nvcc_gendeps = '--generate-dependencies-with-compile --dependency-output $out.d'
+        # SM90-specific compile rule
+        cuda_compile_rule_sm90 = ['rule cuda_compile_sm90'] + cuda_compile_rule[1:] + [
+            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm90'
+        ]
+
+        # SM80-specific compile rule
         cuda_compile_rule_sm80 = ['rule cuda_compile_sm80'] + cuda_compile_rule[1:] + [
             f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm80'
+        ]
+        cuda_compile_rule_sm86 = ['rule cuda_compile_sm86'] + cuda_compile_rule[1:] + [
+            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm86'
+        ]
+        cuda_compile_rule_sm89 = ['rule cuda_compile_sm89'] + cuda_compile_rule[1:] + [
+            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm89'
         ]
         cuda_compile_rule_sm80_sm90 = ['rule cuda_compile_sm80_sm90'] + cuda_compile_rule[1:] + [
             f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm80_sm90'
@@ -147,14 +171,19 @@ def _write_ninja_file(path,
     for source_file, object_file in zip(sources, objects):
         is_cuda_source = _is_cuda_file(source_file) and with_cuda
         if is_cuda_source:
+            # Use architecture-specific compile rules for each file
             if source_file.endswith('_sm90.cu'):
-                rule = 'cuda_compile'
+                rule = 'cuda_compile_sm90'  # Only compile sm90 files for sm90
             elif source_file.endswith('_sm80.cu'):
-                rule = 'cuda_compile_sm80'
+                rule = 'cuda_compile_sm80'  # Only compile sm80 files for sm80
+            elif source_file.endswith('_sm86.cu'):
+                rule = 'cuda_compile_sm86'  # Only compile sm86 files for sm86
+            elif source_file.endswith('_sm89.cu'):
+                rule = 'cuda_compile_sm89'  # Only compile sm89 files for sm89
             elif source_file.endswith('_sm100.cu'):
-                rule = 'cuda_compile_sm100'
+                rule = 'cuda_compile_sm100'  # Only compile sm100 files for sm100
             else:
-                rule = 'cuda_compile_sm80_sm90'
+                rule = 'cuda_compile'  # Compile other files for all architectures
         else:
             rule = 'compile'
         if IS_WINDOWS:
@@ -196,7 +225,10 @@ def _write_ninja_file(path,
     blocks = [config, flags, compile_rule]
     if with_cuda:
         blocks.append(cuda_compile_rule)  # type: ignore[possibly-undefined]
+        blocks.append(cuda_compile_rule_sm90)  # type: ignore[possibly-undefined]
         blocks.append(cuda_compile_rule_sm80)  # type: ignore[possibly-undefined]
+        blocks.append(cuda_compile_rule_sm86)  # type: ignore[possibly-undefined]
+        blocks.append(cuda_compile_rule_sm89)  # type: ignore[possibly-undefined]
         blocks.append(cuda_compile_rule_sm80_sm90)  # type: ignore[possibly-undefined]
         blocks.append(cuda_compile_rule_sm100)  # type: ignore[possibly-undefined]
     blocks += [devlink_rule, link_rule, build, devlink, link, default]
@@ -220,6 +252,8 @@ def get_sources():
     sources = [
         "csrc/flash_api.cpp",
         "csrc/flash_fwd_mla_bf16_sm80.cu",
+        "csrc/flash_fwd_mla_bf16_sm86.cu",
+        "csrc/flash_fwd_mla_bf16_sm89.cu",
         "csrc/flash_fwd_mla_bf16_sm90.cu",
         "csrc/flash_fwd_mla_metadata.cu",
     ]
@@ -239,9 +273,18 @@ def get_features_args():
 
 subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
+# Define architecture-specific flags
+cc_flag_sm90 = ["-gencode", "arch=compute_90a,code=sm_90a"]
+cc_flag_sm89 = ["-gencode", "arch=compute_89,code=sm_89"]
+cc_flag_sm86 = ["-gencode", "arch=compute_86,code=sm_86"]
+cc_flag_sm80 = ["-gencode", "arch=compute_80,code=sm_80"]
+
+# Default flags for files that should compile for all architectures
 cc_flag = []
-cc_flag.append("-gencode")
-cc_flag.append("arch=compute_90a,code=sm_90a")
+cc_flag.extend(cc_flag_sm90)
+cc_flag.extend(cc_flag_sm89)
+cc_flag.extend(cc_flag_sm86)
+cc_flag.extend(cc_flag_sm80)
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 

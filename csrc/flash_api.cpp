@@ -74,9 +74,11 @@ mha_fwd_kvcache_mla(
     const at::Tensor &num_splits                 // batch_size + 1
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
+    bool is_sm86 = dprops->major == 8 && dprops->minor == 6;
+    bool is_sm89 = dprops->major == 8 && dprops->minor == 9;
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
-    TORCH_CHECK(is_sm90 || is_sm8x, "Only sm80 to sm90 (inclusive) are supported");
+    TORCH_CHECK(is_sm90 || is_sm89 || is_sm86 || is_sm80, "Only sm80, sm86, sm89, and sm90 are supported");
 
     at::Tensor vcache = vcache_.has_value() ? vcache_.value() : kcache;
 
@@ -194,6 +196,10 @@ mha_fwd_kvcache_mla(
     if (q_dtype == torch::kBFloat16) {
         if (is_sm90) {
             mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576, true>::run(params, stream);
+        } else if (is_sm89) {
+            mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576, false>::run(params, stream);
+        } else if (is_sm86) {
+            mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576, false>::run(params, stream);
         } else {
             mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576, false>::run(params, stream);
         }
@@ -202,8 +208,12 @@ mha_fwd_kvcache_mla(
     else if (q_dtype == torch::kHalf) {
         if (is_sm90) {
             mha_fwd_splitkv_mla<cutlass::half_t, 576, true>::run(params, stream);
+        } else if (is_sm89) {
+            TORCH_CHECK(false, "sm89 only supports bfloat16");
+        } else if (is_sm86) {
+            TORCH_CHECK(false, "sm86 only supports bfloat16");
         } else {
-            TORCH_CHECK(false, "sm80 only support bfloat16");
+            TORCH_CHECK(false, "sm80 only supports bfloat16");
         }
     }
     #endif

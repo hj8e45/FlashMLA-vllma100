@@ -4,6 +4,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
+#include <algorithm>  // for std::min
 
 using namespace cute;
 
@@ -30,6 +31,7 @@ constexpr auto getSmemLayoutK() {
 
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::bfloat16_t, int kHeadDimV_ = 0>
 struct Flash_fwd_kernel_traits_mla {
+    // SM86 (RTX 30xx) has less memory than SM80 datacenter GPUs, so we use smaller blocks
     using Element = elem_type;
     using ElementAccum = float;
     using index_t = int64_t;
@@ -46,9 +48,14 @@ struct Flash_fwd_kernel_traits_mla {
     static constexpr int kHeadDimV = kHeadDimV_ != 0 ? kHeadDimV_ : kHeadDim;
     static_assert(kHeadDimV % 32 == 0);
     static_assert(kHeadDimV <= kHeadDim);
-    static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
-    static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
+    // Use smaller block sizes for SM86 to reduce shared memory usage
+    // For consumer GPUs with limited cache, we use smaller values
+    static constexpr int kBlockKSmem = 32;
+    static constexpr int kSwizzle = 2;
+    // Reduce the pipeline depth to save shared memory
+    static constexpr int kPipelineDepth = 1;  // Reduced from 2
 
+    // SM86 uses the same MMA atom as SM80
     using MMA_Atom_Arch = MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>;
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
@@ -70,7 +77,7 @@ struct Flash_fwd_kernel_traits_mla {
         SmemLayoutAtomQ{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
-    using kP = Int<2>; // pipeline count
+    using kP = Int<kPipelineDepth>; // pipeline count (reduced for SM86)
     using SmemLayoutK = decltype(tile_to_shape(
             getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
             Shape<Int<kBlockN>, Int<kHeadDim>, kP>{}));
@@ -89,7 +96,7 @@ struct Flash_fwd_kernel_traits_mla {
     using SmemLayoutO = decltype(tile_to_shape(
             SmemLayoutAtomO{},
             Shape<Int<kBlockM>, Int<kHeadDimV>>{}));
-    
+
     using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
     using SmemCopyAtomO = Copy_Atom<DefaultCopy, Element>;
@@ -626,7 +633,48 @@ struct mha_fwd_splitkv_mla<T, Headdim, false> {
         static_assert(Headdim == 576);
         FLASH_ASSERT(params.d_v == 512);
         FLASH_ASSERT(params.k_ptr == params.v_ptr);  // Shared_KV
-        using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 64, 32, 4, T, 512>;
-        run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
+
+        // Check if we're using causal attention
+        if (params.is_causal) {
+            // For causal attention, we can safely chunk along the sequence dimension
+            // This is because each position only attends to previous positions
+
+            // Save original parameters
+            void* original_q_ptr = params.q_ptr;
+            void* original_o_ptr = params.o_ptr;
+            void* original_softmax_lse_ptr = params.softmax_lse_ptr;
+            int original_seqlen_q = params.seqlen_q;
+
+            // Define chunk size for sequence dimension
+            const int kChunkSize = 256;  // Process 256 tokens at a time
+
+            // Process each chunk of the query sequence
+            for (int q_start = 0; q_start < original_seqlen_q; q_start += kChunkSize) {
+                int q_chunk_size = std::min(kChunkSize, original_seqlen_q - q_start);
+
+                // Update query pointer and sequence length
+                params.q_ptr = static_cast<T*>(original_q_ptr) + q_start * params.h * params.d;
+                params.seqlen_q = q_chunk_size;
+                params.o_ptr = static_cast<T*>(original_o_ptr) + q_start * params.h * params.d_v;
+                params.softmax_lse_ptr = static_cast<float*>(original_softmax_lse_ptr) + q_start * params.h;
+
+                // Use block sizes that match sm80's kBlockN to avoid shape division errors
+                // sm80 uses kBlockN = 32, which works with kHeadDim = 576
+                using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 16, 32, 2, T, 512>;
+                run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
+            }
+
+            // Restore original parameters
+            params.q_ptr = original_q_ptr;
+            params.o_ptr = original_o_ptr;
+            params.softmax_lse_ptr = original_softmax_lse_ptr;
+            params.seqlen_q = original_seqlen_q;
+        } else {
+            // For non-causal attention, we can't chunk safely, so we process the whole sequence
+            // Use block sizes that match sm80's kBlockN to avoid shape division errors
+            // sm80 uses kBlockN = 32, which works with kHeadDim = 576
+            using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 16, 32, 2, T, 512>;
+            run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
+        }
     }
 };
